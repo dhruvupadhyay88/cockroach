@@ -14,6 +14,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/url"
 	"sort"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -29,6 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
@@ -38,14 +42,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -1112,6 +1121,92 @@ func TestFingerprintCreation(t *testing.T) {
 		}
 	})
 }
+
+
+func TestSQLStatsRecordStatement(t *testing.B) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	monitor := mon.NewUnlimitedMonitor(
+		context.Background(), "test", mon.MemoryResource,
+		nil /* curCount */, nil /* maxHist */, math.MaxInt64, st,
+	)
+
+	insightsProvider := insights.New(st, insights.NewMetrics())
+	sqlStats := sslocal.New(
+		st,
+		sqlstats.MaxMemSQLStatsStmtFingerprints,
+		sqlstats.MaxMemSQLStatsTxnFingerprints,
+		nil, /* curMemoryBytesCount */
+		nil, /* maxMemoryBytesHist */
+		insightsProvider.Writer,
+		monitor,
+		nil, /* reportingSink */
+		nil, /* knobs */
+		insightsProvider.LatencyInformation(),
+	)
+
+	appStats := sqlStats.GetApplicationStats("" /* appName */, false /* internal */)
+	statsCollector := sslocal.NewStatsCollector(
+		st,
+		appStats,
+		sessionphase.NewTimes(),
+		nil, /* knobs */
+	)
+
+	txnId := uuid.FastMakeV4()
+	generateRecord := func() sqlstats.RecordedStmtStats {
+		return sqlstats.RecordedStmtStats{
+			Query:                "update table set s = '{}' where id = '{}'",
+			SessionID:            clusterunique.ID{Uint128: uint128.Uint128{Hi: 0x000000ffffffffff, Lo: 0x1}},
+			StatementID:          clusterunique.ID{Uint128: uint128.Uint128{Hi: 0x000000ffffffffff, Lo: 0x1}},
+			ParseLatencySec:      6.5208e-05,
+			PlanLatencySec:       0.000187043,
+			RunLatencySec:        0.500093489,
+			ServiceLatencySec:    0.509432458,
+			OverheadLatencySec:   1.08399998214569e-06,
+			TransactionID:        txnId,
+			AutoRetryCount:       0,
+			AutoRetryReason:      error(nil),
+			RowsAffected:         8,
+			IdleLatencySec:       0,
+			BytesRead:            240,
+			RowsRead:             8,
+			RowsWritten:          8,
+			Nodes:                []int64{1},
+			StatementType:        1,
+			Plan:                 (*appstatspb.ExplainTreePlanNode)(nil),
+			StatementError:       error(nil),
+			IndexRecommendations: []string(nil),
+			FullScan:             false,
+			ExecStats: &execstats.QueryLevelStats.build("test")
+	}
+
+	processes := []int{8}
+	for _, p := range processes {
+		name := fmt.Sprintf("Process %d", p)
+		t.Run(name, func(t *testing.B) {
+			t.SetParallelism(p)
+			record := generateRecord()
+			t.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					_, err := statsCollector.RecordStatement(
+						ctx,
+						appstatspb.StatementStatisticsKey{
+							Query:        "select * from table where t.l = 1000",
+							Database:     "test-database",
+							App:          "test-app",
+						},
+						record,
+					)
+				}
+			})
+		})
+	}
+}
+
 
 func TestSQLStatsIdleLatencies(t *testing.T) {
 	defer leaktest.AfterTest(t)()

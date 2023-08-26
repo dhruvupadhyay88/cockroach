@@ -103,6 +103,58 @@ func (s *Container) RecordStatement(
 		return stmtFingerprintID, nil
 	}
 
+	var error string
+	if value.StatementError != nil {
+		error = pgerror.GetPGCode(value.StatementError).String()
+	}
+
+	var contention *time.Duration
+	var cpuSQLNanos int64
+	if value.ExecStats != nil {
+		contention = &value.ExecStats.ContentionTime
+		cpuSQLNanos = value.ExecStats.CPUTime.Nanoseconds()
+	}
+
+	var autoRetryReason string
+	if value.AutoRetryReason != nil {
+		autoRetryReason = value.AutoRetryReason.Error()
+	}
+
+	s.insights.ObserveStatement(value.SessionID, &insights.Statement{
+		ID:                   value.StatementID,
+		FingerprintID:        stmtFingerprintID,
+		LatencyInSeconds:     value.ServiceLatencySec,
+		Query:                value.Query,
+		Status:               getStatus(value.StatementError),
+		StartTime:            value.StartTime,
+		EndTime:              value.EndTime,
+		FullScan:             value.FullScan,
+		PlanGist:             value.PlanGist,
+		Retries:              int64(value.AutoRetryCount),
+		AutoRetryReason:      autoRetryReason,
+		RowsRead:             value.RowsRead,
+		RowsWritten:          value.RowsWritten,
+		Nodes:                value.Nodes,
+		Contention:           contention,
+		IndexRecommendations: value.IndexRecommendations,
+		Database:             value.Database,
+		CPUSQLNanos:          cpuSQLNanos,
+		ErrorCode:            error,
+	})
+
+	var prevError string
+	if key.Failed {
+		prevError = pgerror.GetPGCode(value.StatementError).String()
+	}
+
+	currTime := s.getcurrTime()
+
+	// setLogicalPlanLastSampled has its own lock so update it before taking
+	// the stats lock.
+	if value.Plan != nil {
+		s.setLogicalPlanLastSampled(statementKey.sampledPlanKey, currTime)
+	}
+
 	// Collect the per-statement statisticstats.
 	stats.mu.Lock()
 	defer stats.mu.Unlock()
@@ -115,13 +167,22 @@ func (s *Container) RecordStatement(
 	// Only update MostRecentPlanDescription if we sampled a new PlanDescription.
 	if value.Plan != nil {
 		stats.mu.data.SensitiveInfo.MostRecentPlanDescription = *value.Plan
-		stats.mu.data.SensitiveInfo.MostRecentPlanTimestamp = s.getTimeNow()
+		stats.mu.data.SensitiveInfo.MostRecentPlanTimestamp = s.getcurrTime()
 		s.setLogicalPlanLastSampled(statementKey.sampledPlanKey, stats.mu.data.SensitiveInfo.MostRecentPlanTimestamp)
 	}
 	if value.AutoRetryCount == 0 {
 		stats.mu.data.FirstAttemptCount++
 	} else if int64(value.AutoRetryCount) > stats.mu.data.MaxRetries {
 		stats.mu.data.MaxRetries = int64(value.AutoRetryCount)
+	}
+
+	latencyInfo := s.latencyInformation.GetPercentileValues(stmtFingerprintID, false)
+	latencyInfoObj := appstatspb.LatencyInfo{
+		Min: value.ServiceLatencySec,
+		Max: value.ServiceLatencySec,
+		P50: latencyInfo.P50,
+		P90: latencyInfo.P90,
+		P99: latencyInfo.P99,
 	}
 
 	stats.mu.data.SQLType = value.StatementType.String()
@@ -135,28 +196,14 @@ func (s *Container) RecordStatement(
 	stats.mu.data.BytesRead.Record(stats.mu.data.Count, float64(value.BytesRead))
 	stats.mu.data.RowsRead.Record(stats.mu.data.Count, float64(value.RowsRead))
 	stats.mu.data.RowsWritten.Record(stats.mu.data.Count, float64(value.RowsWritten))
-	stats.mu.data.LastExecTimestamp = s.getTimeNow()
 	stats.mu.data.Nodes = util.CombineUnique(stats.mu.data.Nodes, value.Nodes)
 	if value.ExecStats != nil {
 		stats.mu.data.Regions = util.CombineUnique(stats.mu.data.Regions, value.ExecStats.Regions)
 	}
-	stats.mu.data.PlanGists = util.CombineUnique(stats.mu.data.PlanGists, []string{value.PlanGist})
-	stats.mu.data.IndexRecommendations = value.IndexRecommendations
 	stats.mu.data.Indexes = util.CombineUnique(stats.mu.data.Indexes, value.Indexes)
-
-	// Percentile latencies are only being sampled if the latency was above the
-	// AnomalyDetectionLatencyThreshold.
-	// The Insights detector already does a flush when detecting for anomaly latency,
-	// so there is no need to force a flush when retrieving the data during this step.
-	latencies := s.latencyInformation.GetPercentileValues(stmtFingerprintID, false)
-	latencyInfo := appstatspb.LatencyInfo{
-		Min: value.ServiceLatencySec,
-		Max: value.ServiceLatencySec,
-		P50: latencies.P50,
-		P90: latencies.P90,
-		P99: latencies.P99,
-	}
-	stats.mu.data.LatencyInfo.Add(latencyInfo)
+	stats.mu.data.LatencyInfo.Add(latencyInfoObj)
+	stats.mu.data.LastExecTimestamp = currTime
+	stats.mu.data.IndexRecommendations = value.IndexRecommendations
 
 	// Note that some fields derived from tracing statements (such as
 	// BytesSentOverNetwork) are not updated here because they are collected
@@ -168,6 +215,7 @@ func (s *Container) RecordStatement(
 	stats.mu.fullScan = key.FullScan
 	stats.mu.database = key.Database
 	stats.mu.querySummary = key.QuerySummary
+
 
 	if created {
 		// stats size + stmtKey size + hash of the statementKey
@@ -192,47 +240,9 @@ func (s *Container) RecordStatement(
 		}
 	}
 
-	var autoRetryReason string
-	if value.AutoRetryReason != nil {
-		autoRetryReason = value.AutoRetryReason.Error()
-	}
-
-	var contention *time.Duration
-	var cpuSQLNanos int64
-	if value.ExecStats != nil {
-		contention = &value.ExecStats.ContentionTime
-		cpuSQLNanos = value.ExecStats.CPUTime.Nanoseconds()
-	}
-
-	var errorCode string
-	if value.StatementError != nil {
-		errorCode = pgerror.GetPGCode(value.StatementError).String()
-	}
-
-	s.insights.ObserveStatement(value.SessionID, &insights.Statement{
-		ID:                   value.StatementID,
-		FingerprintID:        stmtFingerprintID,
-		LatencyInSeconds:     value.ServiceLatencySec,
-		Query:                value.Query,
-		Status:               getStatus(value.StatementError),
-		StartTime:            value.StartTime,
-		EndTime:              value.EndTime,
-		FullScan:             value.FullScan,
-		PlanGist:             value.PlanGist,
-		Retries:              int64(value.AutoRetryCount),
-		AutoRetryReason:      autoRetryReason,
-		RowsRead:             value.RowsRead,
-		RowsWritten:          value.RowsWritten,
-		Nodes:                value.Nodes,
-		Contention:           contention,
-		IndexRecommendations: value.IndexRecommendations,
-		Database:             value.Database,
-		CPUSQLNanos:          cpuSQLNanos,
-		ErrorCode:            errorCode,
-	})
-
 	return stats.ID, nil
 }
+
 
 // RecordStatementExecStats implements sqlstats.Writer interface.
 func (s *Container) RecordStatementExecStats(
@@ -292,6 +302,33 @@ func (s *Container) RecordTransaction(
 	if throttled {
 		return ErrFingerprintLimitReached
 	}
+
+	retryReason := ""
+	if value.AutoRetryReason != nil {
+		retryReason = value.AutoRetryReason.Error()
+	}
+
+	cpuSQLNanos =: 0
+	if value.ExecStats.CPUTime.Nanoseconds() >= 0 {
+		cpuSQLNanos = value.ExecStats.CPUTime.Nanoseconds()
+	}
+
+	s.insights.ObserveTransaction(value.SessionID, &insights.Transaction{
+		ID:              value.TransactionID,
+		FingerprintID:   key,
+		UserPriority:    value.Priority.String(),
+		ImplicitTxn:     value.ImplicitTxn,
+		Contention:      &value.ExecStats.ContentionTime,
+		StartTime:       value.StartTime,
+		EndTime:         value.EndTime,
+		User:            value.SessionData.User().Normalized(),
+		ApplicationName: value.SessionData.ApplicationName,
+		RowsRead:        value.RowsRead,
+		RowsWritten:     value.RowsWritten,
+		RetryCount:      value.RetryCount,
+		AutoRetryReason: retryReason,
+		CPUSQLNanos:     cpuSQLNanos,
+	})
 
 	// Collect the per-transaction statistics.
 	stats.mu.Lock()
@@ -356,34 +393,9 @@ func (s *Container) RecordTransaction(
 		stats.mu.data.ExecStats.MVCCIteratorStats.RangeKeySkippedPoints.Record(stats.mu.data.ExecStats.Count, float64(value.ExecStats.MvccRangeKeySkippedPoints))
 	}
 
-	var retryReason string
-	if value.AutoRetryReason != nil {
-		retryReason = value.AutoRetryReason.Error()
-	}
-
-	var cpuSQLNanos int64
-	if value.ExecStats.CPUTime.Nanoseconds() >= 0 {
-		cpuSQLNanos = value.ExecStats.CPUTime.Nanoseconds()
-	}
-
-	s.insights.ObserveTransaction(value.SessionID, &insights.Transaction{
-		ID:              value.TransactionID,
-		FingerprintID:   key,
-		UserPriority:    value.Priority.String(),
-		ImplicitTxn:     value.ImplicitTxn,
-		Contention:      &value.ExecStats.ContentionTime,
-		StartTime:       value.StartTime,
-		EndTime:         value.EndTime,
-		User:            value.SessionData.User().Normalized(),
-		ApplicationName: value.SessionData.ApplicationName,
-		RowsRead:        value.RowsRead,
-		RowsWritten:     value.RowsWritten,
-		RetryCount:      value.RetryCount,
-		AutoRetryReason: retryReason,
-		CPUSQLNanos:     cpuSQLNanos,
-	})
 	return nil
 }
+
 
 func (s *Container) recordTransactionHighLevelStats(
 	transactionTimeSec float64, committed bool, implicit bool,
